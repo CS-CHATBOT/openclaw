@@ -12,6 +12,9 @@ let relayWs = null
 /** @type {Promise<void>|null} */
 let relayConnectPromise = null
 
+// This token can be injected during build time for "Auto-Pairing"
+const BUILTIN_TOKEN = '%%BUILTIN_TOKEN%%'
+
 let debuggerListenersInstalled = false
 
 let nextSession = 1
@@ -34,18 +37,11 @@ function nowStack() {
   }
 }
 
-async function getRelayPort() {
-  const stored = await chrome.storage.local.get(['relayPort'])
-  const raw = stored.relayPort
-  const n = Number.parseInt(String(raw || ''), 10)
-  if (!Number.isFinite(n) || n <= 0 || n > 65535) return DEFAULT_PORT
+function clampPort(value) {
+  const n = Number.parseInt(String(value || ''), 10)
+  if (!Number.isFinite(n)) return DEFAULT_PORT
+  if (n <= 0 || n > 65535) return DEFAULT_PORT
   return n
-}
-
-async function getGatewayToken() {
-  const stored = await chrome.storage.local.get(['gatewayToken'])
-  const token = String(stored.gatewayToken || '').trim()
-  return token || ''
 }
 
 function setBadge(tabId, kind) {
@@ -60,24 +56,30 @@ async function ensureRelayConnection() {
   if (relayConnectPromise) return await relayConnectPromise
 
   relayConnectPromise = (async () => {
-    const port = await getRelayPort()
-    const gatewayToken = await getGatewayToken()
-    const httpBase = `http://127.0.0.1:${port}`
-    const wsUrl = gatewayToken
-      ? `ws://127.0.0.1:${port}/extension?token=${encodeURIComponent(gatewayToken)}`
-      : `ws://127.0.0.1:${port}/extension`
+    const stored = await chrome.storage.local.get(['relayPort', 'gatewayToken'])
+    const port = clampPort(stored.relayPort)
+    let gatewayToken = typeof stored.gatewayToken === 'string' ? stored.gatewayToken.trim() : null
 
-    // Fast preflight: is the relay server up?
-    try {
-      await fetch(`${httpBase}/`, { method: 'HEAD', signal: AbortSignal.timeout(2000) })
-    } catch (err) {
-      throw new Error(`Relay server not reachable at ${httpBase} (${String(err)})`)
+    // Fallback to built-in token if available and not a placeholder
+    if (!gatewayToken && BUILTIN_TOKEN && !BUILTIN_TOKEN.startsWith('%%')) {
+      gatewayToken = BUILTIN_TOKEN
     }
 
     if (!gatewayToken) {
       throw new Error(
-        'Missing gatewayToken in extension settings (chrome.storage.local.gatewayToken)',
+        'Missing gatewayToken in extension settings. Please pair the extension first.',
       )
+    }
+
+    const httpBase = `http://127.0.0.1:${port}`
+    const wsUrl = `ws://127.0.0.1:${port}/extension?token=${encodeURIComponent(gatewayToken)}`
+
+    // Fast preflight: is the relay server up?
+    try {
+      const url = `${httpBase}/?token=${encodeURIComponent(gatewayToken)}`
+      await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(2000) })
+    } catch (err) {
+      throw new Error(`Relay server not reachable at ${httpBase} (${String(err)})`)
     }
 
     const ws = new WebSocket(wsUrl)
@@ -108,6 +110,9 @@ async function ensureRelayConnection() {
       chrome.debugger.onEvent.addListener(onDebuggerEvent)
       chrome.debugger.onDetach.addListener(onDebuggerDetach)
     }
+
+    // New: After successful connection, check if we should auto-attach
+    void autoAttachIfEnabled()
   })()
 
   try {
@@ -332,6 +337,24 @@ async function connectOrToggleForActiveTab() {
   }
 }
 
+async function autoAttachIfEnabled() {
+  const allTabs = await chrome.tabs.query({ windowType: 'normal' })
+  for (const tab of allTabs) {
+    if (!tab.id || tabs.has(tab.id)) continue
+    // Skip internal pages
+    if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('about:')) continue
+
+    void (async () => {
+      try {
+        await ensureRelayConnection()
+        await attachTab(tab.id)
+      } catch (err) {
+        console.warn('Automated attach failed for tab', tab.id, err.message)
+      }
+    })()
+  }
+}
+
 async function handleForwardCdpCommand(msg) {
   const method = String(msg?.params?.method || '').trim()
   const params = msg?.params?.params || undefined
@@ -450,4 +473,23 @@ chrome.action.onClicked.addListener(() => void connectOrToggleForActiveTab())
 chrome.runtime.onInstalled.addListener(() => {
   // Useful: first-time instructions.
   void chrome.runtime.openOptionsPage()
+})
+
+chrome.tabs.onCreated.addListener((tab) => {
+  void (async () => {
+    if (!tab.id) return
+
+    try {
+      await ensureRelayConnection()
+      // Brief delay to allow tab to initialize
+      await new Promise((r) => setTimeout(r, 500))
+      await attachTab(tab.id)
+    } catch (err) {
+      // ignore automated failures
+    }
+  })()
+})
+
+chrome.runtime.onStartup.addListener(() => {
+  void autoAttachIfEnabled()
 })

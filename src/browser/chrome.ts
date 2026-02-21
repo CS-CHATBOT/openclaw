@@ -222,6 +222,16 @@ export async function launchOpenClawChrome(
       args.push(...resolved.extraArgs);
     }
 
+    // Auto-load OpenClaw extension if it exists in the assets folder
+    // In Docker, this is usually at /app/assets/chrome-extension
+    // Locally, it's relative to the project root.
+    const projectRoot = process.cwd();
+    const extensionPath = path.resolve(projectRoot, "assets/chrome-extension");
+    if (fs.existsSync(extensionPath) && fs.existsSync(path.join(extensionPath, "manifest.json"))) {
+      args.push(`--load-extension=${extensionPath}`);
+      log.info(`🦞 Auto-loading extension from: ${extensionPath}`);
+    }
+
     // Always open a blank tab to ensure a target exists.
     args.push("about:blank");
 
