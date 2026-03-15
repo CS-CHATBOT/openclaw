@@ -234,88 +234,47 @@ function loadSkillEntries(
     });
     const baseDir = resolved.baseDir;
 
-    // If the root itself is a skill directory, just load it directly (but enforce size cap).
-    const rootSkillMd = path.join(baseDir, "SKILL.md");
-    if (fs.existsSync(rootSkillMd)) {
-      try {
-        const size = fs.statSync(rootSkillMd).size;
-        if (size > limits.maxSkillFileBytes) {
-          skillsLogger.warn("Skipping skills root due to oversized SKILL.md.", {
-            dir: baseDir,
-            filePath: rootSkillMd,
-            size,
-            maxSkillFileBytes: limits.maxSkillFileBytes,
-          });
-          return [];
-        }
-      } catch {
-        return [];
+    // Search for all SKILL.md files recursively up to a reasonable depth.
+    const skillDirs: string[] = [];
+    const scanDir = (current: string, depth: number) => {
+      if (depth > 5) return; // Prevent infinite recursion/pathological depth
+      const skillMd = path.join(current, "SKILL.md");
+      if (fs.existsSync(skillMd)) {
+        skillDirs.push(current);
+        return; // Found a skill, don't descend further into this skill directory
       }
 
-      const loaded = loadSkillsFromDir({ dir: baseDir, source: params.source });
-      return unwrapLoadedSkills(loaded);
-    }
+      if (skillDirs.length >= limits.maxSkillsLoadedPerSource) return;
 
-    const childDirs = listChildDirectories(baseDir);
-    const suspicious = childDirs.length > limits.maxCandidatesPerRoot;
+      const children = listChildDirectories(current);
+      for (const child of children) {
+        scanDir(path.join(current, child), depth + 1);
+        if (skillDirs.length >= limits.maxSkillsLoadedPerSource) break;
+      }
+    };
 
-    const maxCandidates = Math.max(0, limits.maxSkillsLoadedPerSource);
-    const limitedChildren = childDirs.slice().sort().slice(0, maxCandidates);
-
-    if (suspicious) {
-      skillsLogger.warn("Skills root looks suspiciously large, truncating discovery.", {
-        dir: params.dir,
-        baseDir,
-        childDirCount: childDirs.length,
-        maxCandidatesPerRoot: limits.maxCandidatesPerRoot,
-        maxSkillsLoadedPerSource: limits.maxSkillsLoadedPerSource,
-      });
-    } else if (childDirs.length > maxCandidates) {
-      skillsLogger.warn("Skills root has many entries, truncating discovery.", {
-        dir: params.dir,
-        baseDir,
-        childDirCount: childDirs.length,
-        maxSkillsLoadedPerSource: limits.maxSkillsLoadedPerSource,
-      });
-    }
+    scanDir(baseDir, 0);
 
     const loadedSkills: Skill[] = [];
-
-    // Only consider immediate subfolders that look like skills (have SKILL.md) and are under size cap.
-    for (const name of limitedChildren) {
-      const skillDir = path.join(baseDir, name);
-      const skillMd = path.join(skillDir, "SKILL.md");
-      if (!fs.existsSync(skillMd)) {
-        continue;
-      }
+    for (const skillDir of skillDirs) {
       try {
+        const skillMd = path.join(skillDir, "SKILL.md");
         const size = fs.statSync(skillMd).size;
         if (size > limits.maxSkillFileBytes) {
           skillsLogger.warn("Skipping skill due to oversized SKILL.md.", {
-            skill: name,
+            skill: path.join(params.source, path.relative(baseDir, skillDir)),
             filePath: skillMd,
             size,
             maxSkillFileBytes: limits.maxSkillFileBytes,
           });
           continue;
         }
+
+        const loaded = loadSkillsFromDir({ dir: skillDir, source: params.source });
+        loadedSkills.push(...unwrapLoadedSkills(loaded));
       } catch {
         continue;
       }
-
-      const loaded = loadSkillsFromDir({ dir: skillDir, source: params.source });
-      loadedSkills.push(...unwrapLoadedSkills(loaded));
-
-      if (loadedSkills.length >= limits.maxSkillsLoadedPerSource) {
-        break;
-      }
-    }
-
-    if (loadedSkills.length > limits.maxSkillsLoadedPerSource) {
-      return loadedSkills
-        .slice()
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .slice(0, limits.maxSkillsLoadedPerSource);
     }
 
     return loadedSkills;
